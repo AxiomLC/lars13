@@ -1,160 +1,159 @@
-# J.A.R.V.I.S — Voice + HUD for Hermes Agent
+# Lars13 — Voice + HUD for Hermes Agent (Windows)
 
-A self-hosted, Iron-Man-style voice assistant and command center built on top of
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearch's
-open-source autonomous agent). Talk to a *real* agent — one with persistent
-memory, terminal access, web search, file tools, and 80+ skills — through a
-glowing arc-reactor HUD in any browser on your LAN, or a push-to-talk client.
+A self-hosted, Iron-Man-style voice assistant and command center for
+[Hermes Agent](https://github.com/NousResearch/hermes-agent), ported to run on
+**Windows 10** against a **local** Hermes instance. Forked from
+[`eadmin2/jarvis_ai`](https://github.com/eadmin2/jarvis_ai) (upstream, macOS).
+Talk to a *real* agent — persistent memory, terminal access, web search, file
+tools, skills — through the arc-reactor HUD in any browser on your LAN, or the
+push-to-talk client.
 
-**Everything runs on your own hardware.** The only cloud calls are your LLM
-provider (via Hermes) and ElevenLabs for the voice. Speech-to-text is fully
-local (Whisper on CPU).
-
-## Demo
-
-[![Watch the J.A.R.V.I.S demo](https://img.youtube.com/vi/YNI9pm3h6x8/hqdefault.jpg)](https://youtu.be/YNI9pm3h6x8)
-
-▶ **[Watch the demo on YouTube](https://youtu.be/YNI9pm3h6x8)** — live transcription, agent tool calls, holographic media panels, and the cinematic boot, all in real time.
+**The key custom feature:** a **TTS provider toggle** — switch between
+Deepgram, Fish Audio, Groq, DeepInfra, ElevenLabs, or a local fallback engine
+by editing one line of config. Built for a latency-first experiment (lowest
+first audio byte so barge-in stays snappy), with price as the tiebreaker.
 
 ## What it does
 
+Click the ring and speak. Your words transcribe **live on screen**. The
+transcript goes to the **'lars' profile session** in the local Hermes Agent,
+which actually *does things* — runs commands, searches, remembers — and the
+reply streams back as speech, sentence by sentence, while the rest is still
+being generated.
 
-Click the ring and speak. Your words transcribe **live on screen** while you
-talk. The transcript goes to Hermes Agent, which actually *does things* — reads
-and writes files, runs commands, searches the web, remembers you across
-sessions — and the reply streams back as speech, sentence by sentence, while
-the rest is still being generated. Typical round trip: 3–5 seconds.
+- **Live agent activity** — tool calls with command previews
+- **STOP / barge-in** — halt or cut off the agent mid-sentence
+- **Approval cards** — dangerous commands pause for ALLOW/DENY
+- **Embedded dashboards** — Hermes kanban and session browser in animated viewers
+- **HUD media panels** — agent-driven video/image panels via the bundled
+  `hermes-plugin/hud_display`
+- **Usage tracking** — tokens, turns, TTS character counts
+- **Privacy filter** — secret-shaped strings redacted before text reaches
+  cloud TTS
+- **Cinematic boot** — press `B`
 
-The HUD around the ring is a real control center:
+## TTS providers (the toggle)
 
-- **Live agent activity** — watch tool calls happen with command previews
-- **STOP button** — halt a runaway agent turn mid-tool-call (Esc works too)
-- **Approval cards** — dangerous commands pause for your ALLOW/DENY
-- **Interrupt-aware barge-in** — cut it off mid-sentence; it knows exactly
-  what you heard and what you didn't
-- **Embedded dashboards** — Hermes' kanban board and session browser pop up
-  in animated viewers, fully interactive
-- **Holographic media panels** — say *"show me a video of how arc reactors
-  work, on screen"* and a panel swoops in from Z-depth, traces its frame,
-  materializes through a scanline, and plays the video. The agent drives it
-  through a bundled Hermes plugin (`hud_display`); panels can fly into
-  left/right thirds, and "clear the screen" sweeps them away
-- **Usage tracking** — tokens/day, turns, ElevenLabs quota bar
-- **Machines panel** — live CPU/GPU stats for the host and remote workers
-- **Cinematic boot** — press `B`: panels flicker in, ring spins up,
-  "Systems online. Good morning."
-- **Privacy filter** — secret-shaped strings are redacted before any text
-  reaches cloud TTS
-- **Optional GPU ears** — point it at any NVIDIA machine on your LAN running
-  the included sidecar and transcription jumps to `large-v3-turbo` at ~0.2 s,
-  with automatic fallback to local Whisper when that machine is off
-- **Mobile-ready** — responsive layout + Add to Home Screen = full-screen
-  Jarvis app on your phone
+All adapters live in `server/server.py` behind `voice.provider` in
+`server/config/server.yaml`. Every adapter yields raw **pcm_s16le @ 16 kHz**
+to the WebSocket playback path — barge-in behavior is provider-independent.
+
+| `voice.provider` | Transport | Notes |
+|---|---|---|
+| `deepgram` (**default**) | REST `/v1/speak`, raw `linear16@16k`, streams as generated | fastest guaranteed first byte; no header stripping |
+| `fishaudio` | HTTP `/v1/text-to-speech`, `pcm`, `latency: low` | WS token-feed upgrade path |
+| `groq` | OpenAI-compatible `/v1/audio/speech`, WAV → header-stripped | cheapest API tier |
+| `deepinfra` | OpenAI-compatible `/v1/audio/speech` (Kokoro-82M), WAV → header-stripped | cheapest quality option |
+| `elevenlabs` | upstream streaming code, unchanged | quality baseline |
+| `local` | Piper (fallback **only**) | not true streaming; offline/emergency use |
+
+Keys live in `lars13/.env` (gitignored; auto-loaded). See
+[setupREADME.md](setupREADME.md) **DECIDED** for the full evaluation and
+date-stamped design decisions.
 
 ## Architecture
 
 ```
- Browser HUD (any LAN device)          Host machine (tested on macOS / Apple Silicon)
+ Browser HUD (any LAN device)          Host (this Windows box)
  ── https/wss :443 ──────────┐   ┌──────────────────────────────────────┐
    mic · speaker · panels    ├──►│ voice pipeline server (this repo)    │
-                             │   │  STT: faster-whisper (local, free)   │   ┌─────────────────┐
- Push-to-talk client         │   │  TTS: ElevenLabs Flash (streaming)   ├──►│ Hermes Agent     │
- ── ws :8765 ────────────────┘   │  HUD + auth + dashboard TLS proxy    │   │  API :8642 (lo)  │
-                                 └──────────────────────────────────────┘   │  memory · tools  │
-                                                                             │  skills · cron   │
-                                                                             └─────────────────┘
+                             │   │  STT: faster-whisper (local, free)   │   ┌──────────────────┐
+ Push-to-talk client         │   │  TTS: provider toggle (see above)    ├──►│ Hermes Agent      │
+ ── ws :8765 ────────────────┘   │  HUD + auth + dashboard TLS proxy    │   │  API  :8642 (lo)  │
+                                 └──────────────────────────────────────┘   │  Dash :9119 (lo)  │                                                                             │  memory · tools   │
+                                                                            └──────────────────┘
 ```
 
-One brain, many faces: voice and typed chat share a single persistent Hermes
-session, so each knows what you said to the other — and memory survives every
-restart.
+Voice and typed chat share one persistent Hermes session (the `lars` profile's
+session), so each knows what you said to the other.
 
-## Requirements
+## Requirements (this box, verified)
 
-- A machine for the server (tested: Mac mini, Apple Silicon). Linux should
-  work with minor changes (launchd → systemd).
-- [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) installed and
-  configured with an LLM provider
-- Python 3.11+
-- An [ElevenLabs](https://elevenlabs.io) API key (free tier works; ~0.5
-  credits/char on Flash)
-- Any modern browser on the LAN
+- Windows 10, Python 3.13 (venv via **uv**), `uv` on PATH
+- [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) installed —
+  API server on `127.0.0.1:8642`, dashboard on `127.0.0.1:9119`
+- Keys in `.env`: `API_SERVER_KEY`, `JARVIS_HUD_TOKEN`, and any of
+  `DEEPGRAM_API_KEY`, `FISH_API_KEY`, `GROQ_API_KEY`,
+  `DEEPINFRA_API_KEY`, `ELEVENLABS_API_KEY` (only the selected provider's key
+  is required)
+- Any modern browser on the LAN (TLS required for mic access)
 
-## Install
+## Install (Windows)
 
-Full walkthrough in [docs/SETUP.md](docs/SETUP.md). Short version:
+```powershell
+# 1. venv
+uv venv .venv --python 3.13
+uv pip install --python .venv/Scripts/python.exe fastapi uvicorn requests pyyaml `
+    numpy anthropic websockets psutil RealtimeSTT faster-whisper silero-vad
 
-```bash
-# 1. Enable the Hermes Agent API server
-cat >> ~/.hermes/.env <<EOF
-API_SERVER_ENABLED=true
-API_SERVER_KEY=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
-JARVIS_HUD_TOKEN=$(python3 -c 'import secrets;print("jarvis-"+secrets.token_hex(3))')
-ELEVENLABS_API_KEY=your-key-here
-EOF
-hermes gateway   # or set up its LaunchAgent / service
+# 2. config
+Copy-Item server\config\server.example.yaml server\config\server.yaml
+#   edit voice.provider + provider settings; put keys in .env
 
-# 2. This repo
-git clone https://github.com/YOURNAME/jarvis-hermes-hud
-cd jarvis-hermes-hud/server
-python3 -m venv .venv
-.venv/bin/pip install fastapi uvicorn requests pyyaml numpy anthropic \
-    RealtimeSTT faster-whisper silero-vad websockets psutil
-cp config/server.example.yaml config/server.yaml   # edit: your ElevenLabs voice_id etc.
-scripts/make-certs.sh                              # self-signed TLS (browser mic needs it)
-scripts/make-boot-audio.sh YourName                # one-time boot greeting synthesis
+# 3. TLS (self-signed + user-store trust; browser mic needs it)
+powershell -ExecutionPolicy Bypass -File windows\make-certs.ps1
 
-# 3. Run
-.venv/bin/python server.py
-# open https://YOUR_HOST/hud/ → accept cert → enter your JARVIS_HUD_TOKEN → talk
+# 4. run
+powershell -File windows\start.cmd          # or: .venv\Scripts\python.exe server\server.py
+# open https://localhost/hud/ -> accept cert -> JARVIS_HUD_TOKEN -> talk
 ```
 
-For auto-start on boot, see [launchd/](launchd/) (macOS) — the plists document
-two non-obvious macOS traps (external-drive TCC and log paths) that cost us an
-evening.
+First start downloads Whisper `small.en` (~460 MB) and warms up for 60–90 s.
 
-## Usage
+## Operations (Windows)
 
-| Action | How |
+| Task | Command (PowerShell) |
 |---|---|
-| Talk | Click the ring (or Space) · speak · click again to send |
-| Stop the agent | red ■ STOP button or Esc |
-| Barge in | click the ring while it's speaking |
-| Typed chat | input bar at the bottom (same conversation as voice) |
-| Cinematic boot | press `B` |
-| Kanban / dashboards | VIEWS panel → animated pop-up viewers |
-| Phone | open the HUD → Add to Home Screen |
+| Start | `windows\start.cmd` |
+| Stop (kills uvicorn ports) | `windows\stop.cmd` |
+| Health | `windows\health.cmd` |
+| TTS provider switch | edit `server\config\server.yaml` `voice.provider` → restart |
+| Temp provider override | `set LARS13_TTS=<provider>` then `start.cmd` |
+
+Upstream macOS files (`launchd/`, `server/scripts/*.sh`) are kept for
+reference; `windows/` supersedes them on this box. Auto-start: Task Scheduler
+pointing at `windows\start.cmd` (NSSM optional).
 
 ## Repo layout
 
 ```
-server/          FastAPI voice pipeline + HUD host (the core of this project)
+server/          FastAPI voice pipeline + HUD host (the core)
 server/hud/      single-file HUD (vanilla JS, no build step)
-server/scripts/  start/stop/health/smoke + cert & boot-audio generators
-client/          optional Windows/Linux push-to-talk Python client (wake word capable)
-worker/          optional GPU sidecars: big-model STT server + stats agent for the Machines panel
-hermes-plugin/   Hermes tool plugin: lets the agent summon/dismiss HUD media panels
-launchd/         macOS auto-start templates with hard-won TCC + FD-limit notes
-docs/            SETUP, ARCHITECTURE (protocols/endpoints), TROUBLESHOOTING
+server/scripts/  upstream .sh helpers (reference)
+windows/         this fork's start/stop/health/make-certs for Windows
+client/          optional push-to-talk client (wake word capable)
+worker/          optional GPU sidecars
+hermes-plugin/   agent tool plugin: summon/dismiss HUD media panels
+launchd/         upstream macOS auto-start (reference only)
+docs/            upstream SETUP, ARCHITECTURE, TROUBLESHOOTING
+setupREADME.md   the research/build briefing + DECIDED section (frequently updated)
 ```
+
+## Status / current work
+
+- [x] Repo forked & connected: `AxiomLC/lars13` (upstream = `eadmin2/jarvis_ai`; unrelated histories merged)
+- [x] TTS provider toggle implemented (compile-clean, per-provider adapters)
+- [x] Windows scripts + venv (uv) + smoke boot verified (`:8765` listens)
+- [ ] TLS certs + full first-run model download
+- [ ] Live 'lars' profile session binding verification (`:8642` vs `:9119` transport)
+- [ ] First-byte latency bake-off across providers on this hardware
 
 ## Security model
 
-- The Hermes API key never reaches the browser: the HUD talks through a
-  strict allowlist proxy on the voice server.
-- All HUD endpoints + dashboard proxy + browser WebSockets are gated by a
-  token (cookie, entered once per device).
-- Hermes' API binds to loopback only; the dashboard binds to loopback only.
-- Secret-shaped strings are redacted before text leaves for cloud TTS.
-- LAN-only by design — do not port-forward this to the internet.
+- Hermes API key never reaches the browser: the HUD talks through a strict
+  allowlist proxy on the voice server.
+- HUD endpoints + dashboard proxy + WebSockets gated by `JARVIS_HUD_TOKEN`.
+- Hermes API + dashboard bind to loopback only.
+- Secret-shaped strings redacted before text leaves for cloud TTS.
+- LAN-only by design — do not port-forward.
 
 ## Credits & license
 
-Built on [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous
-Research. HUD aesthetics inspired by
-[jarvis-dashboard](https://github.com/AndrewKochulab/jarvis-dashboard).
+Forked from [`eadmin2/jarvis_ai`](https://github.com/eadmin2/jarvis_ai) —
+thanks for the pipeline and HUD. Built on
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research.
 STT by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) /
-[RealtimeSTT](https://github.com/KoljaB/RealtimeSTT). Voice by
-[ElevenLabs](https://elevenlabs.io).
+[RealtimeSTT](https://github.com/KoljaB/RealtimeSTT). TTS by whichever
+provider you toggle: Deepgram, Fish Audio, Groq, DeepInfra, or ElevenLabs.
 
 MIT — see [LICENSE](LICENSE). Use it, fork it, build your own Jarvis.
