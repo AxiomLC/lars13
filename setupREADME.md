@@ -155,3 +155,97 @@ Restore the `terminal`/`run-code` tools, then:
 5. `pip install` into `.venv`, run health check, then live voice-test toggling local vs Groq/DeepInfra.
 
 ---
+# ADDENDUM 1
+## DECIDED — 2026-10-01 16:06 (+02:00)
+
+### TTS provider eval (final) — latency first, price second
+
+Contract facts locked in: `tts_chunks_sync()` yields bytes → `ws.send_bytes()` → browser expects
+raw **pcm_s16le @ 16 kHz**. Barge-in = playback can stop the instant bytes are buffered, so the
+metrics are first-byte latency + container-free output.
+
+**Chosen (implement in this order, all behind `voice.provider` in `server.yaml`):**
+
+| # | provider | transport | why |
+|---|---|---|---|
+| 1 | `deepgram` (default) | REST `POST https://api.deepgram.com/v1/speak?model=aura-2-thalia&encoding=linear16&sample_rate=16000&container=none`, `stream=True`, `iter_content` | streams as generated; ~280 ms TTFB measured by Deepgram (docs), claims ~3× faster than ElevenLabs WS; zero conversion code — linear16@16k is exactly the HUD format |
+| 2 | `fishaudio` | HTTP `POST https://api.fish.audio/v1/tts` SSE-stream, `format: pcm`, `sample_rate: 16000`, `latency: low`; later upgrade: WS `stream_websocket` fed by LLM token stream | token-by-token WS mode speaks before the LLM sentence finishes — pairs perfectly with the Hermes `assistant.delta` stream |
+| 3 | `groq` | OpenAI-compatible `POST https://api.groq.com/openai/v1/audio/speech`, model `playai-tts` (alt `canopylabs/orpheus-v1-english`), `response_format: wav` | cheapest API tier; needs the shared WAV-header-strip shim |
+| 4 | `deepinfra` | OpenAI-compatible `POST https://api.deepinfra.com/v1/audio/speech`, model `hexgrad/Kokoro-82M`, `response_format: wav` | dirt cheap; same WAV-strip shim; native stream endpoint `/v1/text-to-speech/{voice}/stream` as extra option |
+| 5 | `elevenlabs` | upstream code unchanged | baseline / quality reference |
+
+Out of scope for now: `xai` (`wss://api.x.ai/v1/realtime`, base64 chunk stream — WSS adapter is a stretch goal; REST `/v1/tts` is not realtime-streaming and costs $15/1M chars).
+
+**Local TTS is REJECTED for the default path.** Piper (and local Kokoro via onnxruntime) is
+crystal-by-crystal after a full-shot start, not true streaming: no token-in → audio-out incremental
+generation, TTFB advantage vanishes on long sentences, and 16 kHz `low` voices sound robotic.
+Piper stays as a commented-out fallback provider (`local`) for offline/emergency use only.
+Key that stays: `DEEPINFRA_API_KEY` (already present in Hermes `.env`). To be added same place:
+`DEEPGRAM_API_KEY`, `FISH_API_KEY` (or `FISHAUDIO_API_KEY`), `GROQ_API_KEY`, plus existing
+`ELEVENLABS_API_KEY` / `API_SERVER_KEY` / `JARVIS_HUD_TOKEN`. All commented alternatives live in
+`server/config/server.example.yaml` so providers are switched by editing `server.yaml` only.
+
+### Hermes bindings (verified against official docs 2026-10-01)
+
+Connecting to the **'lars' profile** session. Verified in
+`hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration`:
+
+- Transport: API-server session stream, `POST {base}/api/sessions/{id}/chat/stream`
+  (`Accept: text/event-stream`) — upstream `HermesAPI.chat_stream_events()` already matches.
+- `base_url: http://127.0.0.1:8642` (API-server port; `:9119` dashboard is the fallback host,
+  same routes). Key header `Authorization: Bearer $API_SERVER_KEY` (+ optional `X-Hermes-Session-Key`).
+- Interrupt/approval verbs confirmed: `POST /v1/runs/{id}/stop`, `POST /v1/runs/{id}/approval`.
+- Terminal events (`run.completed|failed|cancelled`) carry real `completed/partial/interrupted` flags —
+  upstream slicing already handles this.
+- OPEN (verify live once Hermes is up): POST body field name, upstream sends `{"input": text}`;
+  ADDENDUM 2 example says `{"message": ...`. Accept either / read the 400 message on first run.
+
+Source reference noted: github.com/EKKOLearnAI/ekko-studio (provider adapters + `docs/voice-dialogue.md`
+barge-in model — stop playback on capture, never cancel the in-flight run).
+Voice chat - Connecting to Profile chat Session:
+For connecting an external real-time service (like a custom voice chat pipeline, mobile app, or audio streamer) directly to the **exact profile/agent's active chat stream**, the official reference documentation is the **Programmatic Integration Guide** in the Hermes Agent Developer Documentation.
+
+### Exact Documentation URLs to Give Your Agent
+
+1. **Primary Developer Spec (Programmatic Integration & Streaming API):**
+* **URL:** `[https://hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration](https://hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration)`
+* **Use Case:** Explains session-bound streaming endpoints (`/api/sessions/{id}/chat/stream`), the JSON-RPC event bus protocol, and running real-time event bridges.
+
+
+2. **Session Lifecycle & Handoff Reference:**
+* **URL:** `[https://hermes-agent.nousresearch.com/docs/user-guide/sessions](https://hermes-agent.nousresearch.com/docs/user-guide/sessions)`
+* **Use Case:** Details how Hermes manages session persistence, target session ID binding, and cross-surface handoffs.
+
+
+
+---
+
+### The Exact Endpoints to Connect Remote Voice Services
+
+When building a voice chat pipeline to tap into an existing session without losing state or tool context, instruct your remote service/agent to use these specific local gateway routes:
+
+#### 1. Real-Time Chat Stream Connection (SSE)
+
+To push user audio transcript turns and stream back the agent's real-time tokens:
+
+* **Endpoint:** `POST [http://127.0.0.1:9119/api/sessions/](http://127.0.0.1:9119/api/sessions/){session_id}/chat/stream`
+* **Headers:** `X-Hermes-Session-Token: <TOKEN>` or `Authorization: Bearer <KEY>`
+* **Payload:**
+```json
+{
+  "message": "User spoken transcript text here",
+  "stream": true,
+  "session_id": "your_exact_active_session_id"
+}
+
+```
+
+
+* **Event Stream Outputs:** Emits `assistant.delta` (for streaming TTS generation as tokens land) and terminal events like `assistant.completed`.
+
+#### 2. Standard OpenAI-Compatible Endpoint (Alternative)
+
+If your voice service relies on standard OpenAI SDK wrappers:
+
+* **Endpoint:** `POST [http://127.0.0.1:9119/v1/chat/completions](http://127.0.0.1:9119/v1/chat/completions)`
+* **Header:** Pass `X-Session-Id: <session_id>` to ensure it binds to the exact profile's active session history rather than creating a stateless conversation.
