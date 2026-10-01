@@ -275,3 +275,97 @@ If your voice service relies on standard OpenAI SDK wrappers:
 
 * **Endpoint:** `POST [http://127.0.0.1:9119/v1/chat/completions](http://127.0.0.1:9119/v1/chat/completions)`
 * **Header:** Pass `X-Session-Id: <session_id>` to ensure it binds to the exact profile's active session history rather than creating a stateless conversation.
+
+---
+# ADDENDUM 3 — STATE OF PLAY — 2026-10-01 ~19:30 (+02:00)
+
+## Process map: who spawns what, and who owns which port
+
+Verified live by process inspection (`wmic` + netstat) on this box:
+
+```
+Power on / login
+ ├─ Hermes Desktop (Electron, Hermes.exe parent + renderer/gpu/audio children)   [GUI only]
+ │    ├─ spawns: hermes.exe serve --host 127.0.0.1 --port 0     <- agent backend, RANDOM port
+ │    │           (63020 once, 60126 after respawn; headless, NO platforms, respawns on demand,
+ │    │            'Gateway ready' badge in desktop refers to this socket — NOT :8642)
+ │    └─ spawns: hermes.exe dashboard                            <- :9119 dashboard UI
+ │                (dies if backend restarts; NOT reliably respawned — start manually when missing)
+ │
+ ├─ (required for lars13, manual/install): hermes gateway run|start  <- THE gateway process
+ │    └─ loads ALL platforms per profile .env:
+ │         telegram/discord/... + api_server platform  -> 127.0.0.1:8642  (lars13's LLM target)
+ │
+ └─ lars13 voice pipeline (windows/start.cmd)
+      ├─ :443    https/wss  HUD (browser mic needs this TLS port)
+      ├─ :8765   ws        push-to-talk client (plain)
+      ├─ :8766   https/wss  HUD alt port
+      ├─ :9443   https      dashboard TLS proxy (HUD iframes Hermes dashboard :9119
+      │                     through it — token-gated)
+      └─ STT: faster-whisper small.en int8 on CPU; logs -> server/logs/latency.jsonl
+```
+
+Key facts learned 2026-10-01:
+- Desktop chat works WITHOUT the gateway: desktop window -> hermes serve backend over internal
+  IPC. That is why "Gateway ready" shows while :8642 is dead.
+- The API server is a **gateway platform**, enabled per-profile env (`API_SERVER_ENABLED=true`,
+  `API_SERVER_KEY` in the profile's `.env` — for the 'lars' profile that is
+  `AppData/Local/hermes/profiles/lars/.env`, which currently LACKS them; root `~/.hermes/.env` has
+  them set). On gateway start it prints `[API Server] API server listening on http://127.0.0.1:8642`.
+- `hermes gateway status` on this box showed all gateways DOWN + stale gateway_state.json
+  (ungraceful prior shutdown). FIX: `hermes gateway install` + `hermes gateway start` (scheduled
+  task, survives reboot) or run `hermes gateway run` in a permanent window.
+- Browser mic requires TLS secure origin -> cert.pem/key.pem in server/certs/ (made by
+  windows/make-certs.ps1; pfx->pem conversion via Git Bash openssl). Cert trusted in CurrentUser
+  Root store (valid to ~2031).
+- If all four lars13 ports are NOT listening after start.cmd, the pem files are missing and
+  server.py silently fell back to plain HTTP :8765 only.
+
+## What is expected to work NOW (after: gateway up + dashboard up + start.cmd)
+
+1. HUD loads at https://localhost/hud/ (cert trusted; JARVIS_HUD_TOKEN prompt once).
+2. Voice turn end-to-end: mic -> STT (local whisper) -> POST :8642
+   /api/sessions/{id}/chat/stream -> 'lars' profile session streams reply -> per-sentence TTS ->
+   browser playback. VERIFIED WORKING in turn 2 (transcript -> run created -> reply).
+3. Typed chat box shares the same 'lars' session.
+4. Kanban/dashboards via :9443 proxy when :9119 is up.
+
+## Known issues / work in progress
+
+- STT finalize ~20 s on first utterance (small.en int8, cold). Switch stt.model to base.en in
+  server.yaml for ~3-6 s; tune after TTS works.
+- LLM time-to-first-token ~13 s (agent thinking/tools) — Hermes-side; watch, don't fix yet.
+- Deepgram default model aura-2-thalia -> HTTP 403 INSUFFICIENT_PERMISSIONS on this project
+  (project lacks Aura-2). INTERIM: set voice.model: aura-asteria-en (Aura-1) in server.yaml, or
+  enable Aura-2 in Deepgram console. The 403 surfaced as generic HTTP 4xx text.
+- HUD /v1/skills panel -> Hermes returns 500 "Failed to enumerate skills" (Hermes-side bug/quirk,
+  not lars13; proxy verified faithful). Cosmetic only.
+- Dashboard :9119 must be alive for kanban viewers; starts with desktop, does not auto-heal.
+- Open questions closed in live test turn 2: POST body key {"input"} ACCEPTED by :8642 chat/stream
+  (ADDENDUM 2's "message" example was wrong for API-server transport); profile binding works
+  with API_SERVER_KEY bearer over :8642; sessions cached in server/logs/hermes_sessions.json.
+
+## First-byte latency experiment (the POINT of the fork)
+
+After Deepgram model is fixed: speak identical test phrase per provider, compare
+`time_to_first_tts_audio_byte_seconds` in server/logs/latency.jsonl:
+
+1. deepgram aura-asteria-en (baseline cloud)
+2. fishaudio (latency: low)
+3. groq playai-tts / deepinfra Kokoro-82M (wav-strip path — VERIFIES the WAV shim with real audio)
+4. elevenlabs (reference) — optional, needs voice_id
+5. local piper (fallback proof — expect worst streaming, best offline)
+
+## Second-machine worktree instructions (for the other machine)
+
+```bash
+gh repo clone AxiomLC/lars13
+cd lars13
+git remote add upstream https://github.com/eadmin2/jarvis_ai.git   # reference only
+git fetch upstream
+# windows/ scripts assume Git Bash openssl + uv; else port. Keys: copy a filled .env from this
+# machine (never commit it). Hermes must run the gateway for :8642 — same layout as above.
+```
+
+Branching convention going forward: work on feature branches (`windows`, `tts-providers`,
+`stt-tuning`), merge to main when a turn logs clean in latency.jsonl.

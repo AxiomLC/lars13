@@ -133,10 +133,23 @@ setupREADME.md   the research/build briefing + DECIDED section (frequently updat
 
 - [x] Repo forked & connected: `AxiomLC/lars13` (upstream = `eadmin2/jarvis_ai`; unrelated histories merged)
 - [x] TTS provider toggle implemented (compile-clean, per-provider adapters)
-- [x] Windows scripts + venv (uv) + smoke boot verified (`:8765` listens)
-- [ ] TLS certs + full first-run model download
-- [ ] Live 'lars' profile session binding verification (`:8642` vs `:9119` transport)
+- [x] Windows scripts + venv (uv) + TLS certs + smoke boot verified (all four ports listen)
+- [x] Voice turn end-to-end verified: 'lars' profile session via `:8642` streams a reply
+- [ ] Deepgram model fix (project lacks Aura-2 → use `aura-asteria-en` or enable Aura-2)
 - [ ] First-byte latency bake-off across providers on this hardware
+- [ ] STT speed tuning (`base.en` vs `small.en` — first utterance ~20 s is too slow)
+- [ ] Hermes-side: `/v1/skills` enumeration 500 (HUD panel cosmetic; Hermes bug)
+
+## Troubleshooting (Windows box)
+
+| Symptom | Check / fix |
+|---|---|
+| `https://localhost/hud/` unreachable, only `:8765` in log | cert.pem/key.pem missing in `server/certs/` → re-run `windows\make-certs.ps1` (or convert pfx via Git Bash openssl); server silently falls back to plain HTTP |
+| Turn error: connection refused `127.0.0.1:8642` | Hermes **gateway** process not running → `hermes gateway run` (or `install`+`start`). Note: "Gateway ready" inside the Hermes desktop app is its internal backend — NOT the API server |
+| Dashboard viewers dead; `/api/hermes/*` 500s | dashboard `:9119` down → `hermes dashboard` (desktop spawns but doesn't auto-heal it) |
+| Deepgram HTTP 403 `INSUFFICIENT_PERMISSIONS` | project lacks Aura-2 → set `voice.model: aura-asteria-en` |
+| Skills panel empty + console 500 | Hermes `Failed to enumerate skills` — Hermes-side; ignore |
+| Slow first turn | Whisper small.en cold start (~20 s finalize); switch `stt.model: base.en` |
 
 ## Security model
 
