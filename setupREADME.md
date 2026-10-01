@@ -200,6 +200,32 @@ Connecting to the **'lars' profile** session. Verified in
 - OPEN (verify live once Hermes is up): POST body field name, upstream sends `{"input": text}`;
   ADDENDUM 2 example says `{"message": ...`. Accept either / read the 400 message on first run.
 
+### Comparison: existing Lars voice plugin (Hermes desktop plugin)
+
+Prior art on this box: `C:\Users\Admin\AppData\Local\hermes\desktop-plugins\lars\voice\`
+(`agent_bridge.py` = WS-JSON-RPC bridge to the dashboard gateway
+`ws://127.0.0.1:9119/api/ws?token=lars-voice-bridge-2026`; `voice_server.py` :8000 pipeline;
+`stt/tts_service.py`, `vad.py`, `wake_engine.py` with `silero_vad.onnx` + `hey_lars.txt`).
+
+**Status (user-confirmed 2026-10-01): it successfully binds the 'lars' profile session, but did
+NOT achieve true streaming with barge-in and simultaneous agent listen/talk.** Treat it as a
+reference for session-binding mechanics only (resume → LIVE session id, attach-per-turn lease,
+message.delta handling), not as the latency/streaming target — lars13 supersedes it with the
+provider streaming adapters above.
+
+Lars-bridge mechanics worth reusing if the API-server ':8642' transport can't bind the profile:
+1. `session.most_recent {profile:'lars'}` → stored id → `session.resume` → USE the live id from
+   resume result (stored row id = 'session not found'; verified 2026-09-27).
+2. Attach-per-turn: resume at turn start, `session.close` at turn end (otherwise the core
+   Sessions UI hits SESSION_NOT_OWNED on the same session).
+3. `message.delta`/`message.interim` = incremental; `message.complete.text` is the FULL reply —
+   only use it when no deltas streamed. 120 s quiet gap = turn over.
+4. `session.interrupt` for stop/barge-in of the run; scale-to-zero → resume+retry once.
+
+OPEN (defers to live test once Hermes is up): pick API-server ':8642' (upstream-style, already
+coded) vs dashboard WS ':9119' bridge-style for the 'lars' profile binding; settle
+`{"input"}` vs `{"message"}` in chat/stream POST body.
+
 Source reference noted: github.com/EKKOLearnAI/ekko-studio (provider adapters + `docs/voice-dialogue.md`
 barge-in model — stop playback on capture, never cancel the in-flight run).
 Voice chat - Connecting to Profile chat Session:
