@@ -22,14 +22,16 @@ and approval events. Falls back to direct Anthropic ("basic mode") if unreachabl
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import re
 import threading
 import time
+import wave
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, Iterator
 
 import requests
 import uvicorn
@@ -85,7 +87,7 @@ def read_usage() -> dict:
         except Exception:
             data = {"total": {}, "days": {}}
     return {"total": data.get("total", {}), "today": data.get("days", {}).get(_today(), {})}
-ENV_PATHS = [Path.home() / ".hermes" / ".env", ROOT / ".env"]
+ENV_PATHS = [Path.home() / ".hermes" / ".env", ROOT / ".env", ROOT.parent / ".env"]  # lars13: repo-root .env
 SENTENCE_RE = re.compile(r"(.+?[.!?])(?=\s|$)", re.DOTALL)
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 CODEBLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -433,16 +435,72 @@ class VoicePipelineServer:
                 raise
 
     # ------------------------------------------------------------------ TTS
+    # Provider dispatch for the lars13 TTS toggle (see setupREADME.md DECIDED).
+    # Contract: every adapter yields raw pcm_s16le @ 16000 Hz (the format the
+    # HUD/WS playback path expects), chunk by chunk, for barge-in. WAV-returning
+    # providers are passed through _wav_to_pcm_chunks() to strip the header.
+
+    @staticmethod
+    def _wav_to_pcm_chunks(
+        chunk_iter: Iterator[bytes], timing: TurnTiming,
+    ) -> Iterator[bytes]:
+        """Yield raw s16le PCM from a streaming WAV response: buffer until the
+        'data' chunk is found, stream everything after its 8-byte header."""
+        header = b""
+        for chunk in chunk_iter:
+            if not chunk:
+                continue
+            header += chunk
+            idx = header.find(b"data")
+            if idx != -1 and len(header) >= idx + 8:
+                if timing.first_tts_audio_byte_monotonic is None:
+                    timing.first_tts_audio_byte_monotonic = time.perf_counter()
+                yield header[idx + 8:]
+                break
+        for chunk in chunk_iter:
+            if not chunk:
+                continue
+            if timing.first_tts_audio_byte_monotonic is None:
+                timing.first_tts_audio_byte_monotonic = time.perf_counter()
+            yield chunk
+
+    @staticmethod
+    def _tts_stream_response(response, timing: TurnTiming) -> Iterator[bytes]:
+        """Shared raw-PCM HTTP streaming loop (provider already yields pcm)."""
+        try:
+            for chunk in response.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                if timing.first_tts_audio_byte_monotonic is None:
+                    timing.first_tts_audio_byte_monotonic = time.perf_counter()
+                yield chunk
+        finally:
+            response.close()  # barge-in cancels mid-stream; don't leak the connection
 
     def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
         voice = self.cfg["voice"]
+        provider = (voice.get("provider") or "elevenlabs").lower()
+        timing.tts_model = voice.get("model", provider)
+        timing.voice_id = voice.get("voice_id", "")
+        timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
+        record_usage(tts_chars=len(text))
+        if provider == "elevenlabs":
+            yield from self._tts_elevenlabs(text, timing, voice)
+        elif provider == "deepgram":
+            yield from self._tts_deepgram(text, timing, voice)
+        elif provider == "fishaudio":
+            yield from self._tts_fishaudio(text, timing, voice)
+        elif provider in ("groq", "deepinfra"):
+            yield from self._tts_openai_compatible(provider, text, timing, voice)
+        elif provider == "local":
+            yield from self._tts_piper(text, timing, voice)
+        else:
+            raise RuntimeError(f"Unknown voice.provider '{provider}' in server.yaml")
+
+    def _tts_elevenlabs(self, text: str, timing: TurnTiming, voice: dict) -> Iterator[bytes]:
         key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY") or os.environ.get("XI_API_KEY")
         if not key:
             raise RuntimeError("ElevenLabs API key not found")
-        timing.tts_model = voice["model"]
-        timing.voice_id = voice["voice_id"]
-        timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
-        record_usage(tts_chars=len(text))
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice['voice_id']}/stream"
         params = {"output_format": voice.get("output_format", "pcm_16000")}
         payload = {
@@ -461,15 +519,113 @@ class VoicePipelineServer:
         if response.status_code >= 400:
             response.close()
             raise RuntimeError(f"ElevenLabs HTTP {response.status_code}: {response.text[:1000]}")
+        yield from self._tts_stream_response(response, timing)
+
+    def _tts_deepgram(self, text: str, timing: TurnTiming, voice: dict) -> Iterator[bytes]:
+        """Deepgram Aura: REST /v1/speak streams audio as it is generated.
+        encoding=linear16 + container=none -> raw s16le, no WAV header to strip."""
+        key = os.environ.get("DEEPGRAM_API_KEY")
+        if not key:
+            raise RuntimeError("DEEPGRAM_API_KEY not found")
+        base = (voice.get("base_url") or "https://api.deepgram.com/v1/speak").rstrip("/")
+        params = {
+            "model": voice.get("model", "aura-2-thalia"),
+            "encoding": "linear16",
+            "sample_rate": "16000",
+            "container": "none",
+        }
+        response = requests.post(
+            base, params=params,
+            headers={"Authorization": f"Token {key}", "Content-Type": "application/json"},
+            json={"text": text}, stream=True, timeout=120,
+        )
+        if response.status_code >= 400:
+            response.close()
+            raise RuntimeError(f"Deepgram HTTP {response.status_code}: {response.text[:1000]}")
+        yield from self._tts_stream_response(response, timing)
+
+    def _tts_fishaudio(self, text: str, timing: TurnTiming, voice: dict) -> Iterator[bytes]:
+        """Fish Audio HTTP streaming: format=pcm + sample_rate -> raw s16le.
+        reference_id selects a cloned/stock voice; later upgrade path is the
+        WS mode fed directly from the Hermes assistant.delta token stream."""
+        key = os.environ.get("FISH_API_KEY") or os.environ.get("FISHAUDIO_API_KEY")
+        if not key:
+            raise RuntimeError("FISH_API_KEY not found")
+        base = (voice.get("base_url") or "https://api.fish.audio/v1/text-to-speech").rstrip("/")
+        payload = {
+            "text": text,
+            "format": "pcm",
+            "sample_rate": 16000,
+            "latency": voice.get("latency", "low"),
+        }
+        if voice.get("voice_id"):
+            payload["reference_id"] = voice["voice_id"]
+        response = requests.post(
+            base,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                     "Accept": "audio/pcm"},
+            json=payload, stream=True, timeout=120,
+        )
+        if response.status_code >= 400:
+            response.close()
+            raise RuntimeError(f"FishAudio HTTP {response.status_code}: {response.text[:1000]}")
+        yield from self._tts_stream_response(response, timing)
+
+    def _tts_openai_compatible(
+        self, provider: str, text: str, timing: TurnTiming, voice: dict,
+    ) -> Iterator[bytes]:
+        """Groq / DeepInfra share the OpenAI /v1/audio/speech shape.
+        Both return WAV (no raw pcm option) -> strip header via _wav_to_pcm_chunks."""
+        endpoints = {
+            "groq": ("https://api.groq.com/openai/v1/audio/speech", "GROQ_API_KEY"),
+            "deepinfra": ("https://api.deepinfra.com/v1/audio/speech", "DEEPINFRA_API_KEY"),
+        }
+        base, key_env = endpoints[provider]
+        key = os.environ.get(key_env)
+        if not key:
+            raise RuntimeError(f"{key_env} not found")
+        url = ((voice.get("base_url") or "") if provider == (voice.get("provider") or "") else "").rstrip("/") or base
+        payload = {
+            "model": voice.get("model"),
+            "input": text,
+            "voice": voice.get("voice_name", ""),
+            "response_format": "wav",
+        }
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload, stream=True, timeout=120,
+        )
+        if response.status_code >= 400:
+            response.close()
+            raise RuntimeError(f"{provider} HTTP {response.status_code}: {response.text[:1000]}")
+        yield from self._wav_to_pcm_chunks(response.iter_content(chunk_size=4096), timing)
+
+    def _tts_piper(self, text: str, timing: TurnTiming, voice: dict) -> Iterator[bytes]:
+        """LOCAL FALLBACK ONLY (see setupREADME.md DECIDED): Piper is not true
+        streaming (synthesizes the sentence before the first byte), so it loses
+        to the cloud providers on perceived latency. Kept for offline/emergency.
+        Use a 16 kHz 'low' quality voice so no resampling is needed."""
+        model_path = voice.get("piper_model")
+        if not model_path:
+            raise RuntimeError("voice.piper_model not set in server.yaml")
         try:
-            for chunk in response.iter_content(chunk_size=4096):
-                if not chunk:
-                    continue
-                if timing.first_tts_audio_byte_monotonic is None:
-                    timing.first_tts_audio_byte_monotonic = time.perf_counter()
-                yield chunk
-        finally:
-            response.close()  # barge-in cancels mid-stream; don't leak the connection
+            from piper import PiperVoice
+        except ImportError as exc:
+            raise RuntimeError("local TTS selected but piper-tts is not installed (pip install piper-tts)") from exc
+        if not hasattr(self, "_piper_voice"):
+            self._piper_voice = PiperVoice.load(model_path)
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            self._piper_voice.synthesize(text, wav_file)
+        pcm = wav_buf.getvalue()[44:]  # strip the 44-byte canonical WAV header
+        if timing.first_tts_audio_byte_monotonic is None:
+            timing.first_tts_audio_byte_monotonic = time.perf_counter()
+        for i in range(0, len(pcm), 4096):
+            yield pcm[i:i + 4096]
 
     # ------------------------------------------------------------- Turn flow
 

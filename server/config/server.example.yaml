@@ -65,10 +65,24 @@ security:
   extra_origin_hosts: []            # e.g. ["192.168.1.10"] if you open the HUD by raw IP
 
 voice:
-  provider: elevenlabs
-  model: eleven_flash_v2_5
-  voice_name: "Your chosen voice"
-  voice_id: YOUR_ELEVENLABS_VOICE_ID
+  # lars13 provider toggle (see setupREADME.md DECIDED). Every adapter yields
+  # raw pcm_s16le @ 16000 Hz. Switch = edit provider + restart.
+  # provider: deepgram | fishaudio | groq | deepinfra | elevenlabs | local
+  provider: deepgram
+
+  # --- deepgram (DEFAULT) - raw linear16 stream, no headers to strip ---
+  model: aura-2-thalia
+  # base_url: https://api.deepgram.com/v1/speak
+
+  # --- fishaudio: latency: low|normal|balanced; voice_id: reference_id ---
+  # --- groq: model: playai-tts, voice_name: Fritz-PlayAI ---
+  # --- deepinfra: model: hexgrad/Kokoro-82M, voice_name: af_heart ---
+  # --- elevenlabs: model: eleven_flash_v2_5, voice_name: <name>, voice_id: <id>, output_format: pcm_16000 ---
+  # --- local ( Piper, fallback ONLY - not true streaming; pip install piper-tts) ---
+  #   model: piper
+  #   piper_model: models/piper/en_US-lessac-low.onnx   # 16 kHz low voice -> no resample
+  voice_name: "thalia"
+  voice_id:
   output_format: pcm_16000
 
 persona:                     # used only by the anthropic fallback path
